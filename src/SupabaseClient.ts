@@ -131,82 +131,48 @@ export default class SupabaseClient {
   }
 
   /**
-   * Remove all subscriptions.
+   * Closes and removes all subscriptions and returns the number
+   * of previously open subscriptions.
    */
-  async removeAllSubscriptions(): Promise<
-    (
-      | {
-          status: 'fulfilled'
-          value: {
-            error: null
-          }
-        }
-      | { status: 'rejected'; reason: { error: Error } }
-    )[]
-  > {
-    const subs: RealtimeSubscription[] = this.realtime.channels.slice()
-    const removeSubPromises = subs.map((sub: RealtimeSubscription) =>
-      this.removeSubscription(sub)
-        .then((): { status: 'fulfilled'; value: { error: null } } => ({
-          status: 'fulfilled',
-          value: { error: null },
-        }))
-        .catch((reason: { error: Error }): { status: 'rejected'; reason: { error: Error } } => ({
-          status: 'rejected',
-          reason,
-        }))
-    )
-    return Promise.all(removeSubPromises)
+  async removeAllSubscriptions(): Promise<{ removedSubscriptions: number }> {
+    const allSubs: RealtimeSubscription[] = this.getSubscriptions().slice()
+    const openSubCount = allSubs.filter((chan) => chan.isJoined()).length
+    const subPromises = allSubs.map((sub) => this.removeSubscription(sub))
+
+    await Promise.all(subPromises)
+
+    return { removedSubscriptions: openSubCount }
   }
 
   /**
-   * Removes an active subscription and returns the number of open connections.
+   * Closes and removes a subscription and returns the number of open subscriptions.
    *
-   * @param subscription The subscription you want to remove.
+   * @param subscription The subscription you want to close and remove.
    */
-  removeSubscription(subscription: RealtimeSubscription): Promise<
-    | {
-        data: { openSubscriptions: number }
-        error: null
-      }
-    | { error: Error }
-  > {
-    return new Promise(async (resolve, reject) => {
-      const { error } = await this._closeSubscription(subscription)
+  async removeSubscription(
+    subscription: RealtimeSubscription
+  ): Promise<{ openSubscriptions: number }> {
+    await this._closeSubscription(subscription)
 
-      if (error) {
-        return reject({ error })
-      }
+    const allSubs: RealtimeSubscription[] = this.getSubscriptions()
+    const openSubCount = allSubs.filter((chan) => chan.isJoined()).length
 
-      const allSubscriptions = this.getSubscriptions()
+    if (allSubs.length === 0) await this.realtime.disconnect()
 
-      if (allSubscriptions.length === 0) {
-        const { error } = await this.realtime.disconnect()
-
-        if (error) {
-          return reject({ error })
-        }
-      }
-
-      const openSubscriptionsCount = allSubscriptions.filter((chan) => chan.isJoined()).length
-
-      return resolve({
-        data: { openSubscriptions: openSubscriptionsCount },
-        error: null,
-      })
-    })
+    return { openSubscriptions: openSubCount }
   }
 
-  private async _closeSubscription(
-    subscription: RealtimeSubscription
-  ): Promise<{ error: null | Error }> {
-    if (!subscription.isClosed()) {
-      return await this._closeChannel(subscription)
-    }
+  private async _closeSubscription(subscription: RealtimeSubscription): Promise<void> {
+    if (!subscription.isClosed()) await this._unsubscribeSubscription(subscription)
+    this.realtime.remove(subscription)
+  }
 
+  private async _unsubscribeSubscription(subscription: RealtimeSubscription): Promise<void> {
+    const subPush = subscription.unsubscribe()
     return new Promise((resolve) => {
-      this.realtime.remove(subscription)
-      return resolve({ error: null })
+      ;['ok', 'error', 'timeout'].forEach((status) => {
+        subPush.receive(status, () => resolve())
+      })
     })
   }
 
@@ -263,16 +229,6 @@ export default class SupabaseClient {
     return headers
   }
 
-  private _closeChannel(subscription: RealtimeSubscription): Promise<{ error: null | Error }> {
-    return new Promise((resolve, reject) => {
-      subscription
-        .unsubscribe()
-        .receive('ok', () => resolve({ error: null }))
-        .receive('error', (error: Error) => reject({ error }))
-        .receive('timeout', () => reject({ error: 'timed out' }))
-    })
-  }
-
   private _listenForMultiTabEvents() {
     if (!this.multiTab || !isBrowser() || !window?.addEventListener) {
       return null
@@ -325,7 +281,7 @@ export default class SupabaseClient {
       this.changedAccessToken = token
     } else if (event === 'SIGNED_OUT' || event === 'USER_DELETED') {
       // Token is removed
-      this.removeAllSubscriptions()
+      this.realtime.setAuth(this.supabaseKey)
       if (source == 'STORAGE') this.auth.signOut()
     }
   }
